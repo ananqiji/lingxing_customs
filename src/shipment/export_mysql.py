@@ -82,6 +82,38 @@ DEFAULT_PROTECTED_CUSTOMS_ROW_IDS = {
     "5178d4127e453c79",
     "250222378bd13932",
     "fd6b62cf0ecda2f9",
+    # Supplier and source overrides from customs_bill_parcels.xlsx, 2026-09-28.
+    # SP260928085
+    "0122daa6126af36c",
+    "39395e8dc9c6c0cb",
+    "3bc2c0dff6dce55e",
+    "4650489d08e854a3",
+    "52f5a4f540718167",
+    "5dc4c6ff2e529ba4",
+    "6d05ab561650a0b8",
+    # SP260928106
+    "bfddedfbcdc7c3c1",
+    # SP260928108
+    "0329b175b6e8c678",
+    "0a6acdaa0f1b2553",
+    "837a0767d6945c62",
+    "93201227aa7475e6",
+    "a0c5d5f4a27d28ac",
+    "c204ab883b262a2f",
+    # SP260928109
+    "2e634ec7acfe2df1",
+    "30d67a16b42637da",
+    "aaf157553e9518ee",
+    "cf491617c67c6a9f",
+    # SP260928089: customs_bill_parcels 02.xlsx, 2026-09-28.
+    "02d6793472d4de96",
+    "079abccda02ec1e9",
+    "7a70bde29c2344da",
+    "94250830be00ef23",
+    "9c25722c32aa5a18",
+    "9c7fbe63e435fece",
+    "e2aa7b8b78c0f62e",
+    "f679947bd902bb06",
 }
 
 DEFAULT_PROTECTED_CUSTOMS_SHIPMENT_NOS = {
