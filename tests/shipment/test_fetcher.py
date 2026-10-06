@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from src.common.lingxing_client import LingxingClientError
 from src.shipment.build_rows import build_customs_workbook_data
@@ -25,7 +26,7 @@ class FakeClient:
     def post(self, endpoint, payload):
         self.post_payloads.append((endpoint, payload))
         if endpoint.endswith("getInboundShipmentList"):
-            page = payload.get("page", 1)
+            page = 1 if payload.get("offset", 0) == 0 else 2
             rows = (
                 [
                     {"shipment_sn": "SP1", "pick_time": "2026-06-09", "shipment_time": "2026-06-10", "status": 1, "wname": WAREHOUSE},
@@ -49,7 +50,7 @@ class EnrichmentClient(FakeClient):
     def post(self, endpoint, payload):
         self.post_payloads.append((endpoint, payload))
         if endpoint.endswith("getInboundShipmentList"):
-            rows = [{"shipment_sn": "SP1", "pick_time": "2026-06-09", "status": 1, "wname": WAREHOUSE}] if payload.get("page", 1) == 1 else []
+            rows = [{"shipment_sn": "SP1", "pick_time": "2026-06-09", "status": 1, "wname": WAREHOUSE}] if payload.get("offset", 0) == 0 else []
             return {"code": 0, "data": {"list": rows}}
         if endpoint.endswith("getInboundShipmentListMwsDetail"):
             return {
@@ -137,7 +138,11 @@ class LingxingApiDataSourceTest(unittest.TestCase):
         rows = source._fetch_shipment_headers("2026-06-09")
 
         self.assertEqual([row["shipment_sn"] for row in rows], ["SP1"])
-        self.assertEqual(client.post_payloads[0][1]["shipment_time"], "2026-06-09")
+        self.assertEqual(client.post_payloads[0][1]["start_date"], "2026-06-09")
+        self.assertEqual(client.post_payloads[0][1]["end_date"], "2026-06-09")
+        self.assertEqual(client.post_payloads[0][1]["status"], 1)
+        self.assertNotIn("shipment_time", client.post_payloads[0][1])
+        self.assertNotIn("page", client.post_payloads[0][1])
         self.assertEqual(client.post_payloads[0][1]["time_type"], 0)
 
     def test_filters_voided_shipment_from_status_name(self) -> None:
@@ -145,9 +150,7 @@ class LingxingApiDataSourceTest(unittest.TestCase):
             def post(self, endpoint, payload):
                 self.post_payloads.append((endpoint, payload))
                 if endpoint.endswith("getInboundShipmentList"):
-                    if payload.get("status") == "\u5df2\u53d1\u8d27":
-                        rows = []
-                    elif payload.get("page", 1) == 1:
+                    if payload.get("offset", 0) == 0:
                         rows = [
                             {
                                 "shipment_sn": "SP260707014",
@@ -178,13 +181,13 @@ class LingxingApiDataSourceTest(unittest.TestCase):
             def post(self, endpoint, payload):
                 self.post_payloads.append((endpoint, payload))
                 if endpoint.endswith("getInboundShipmentList"):
-                    page = payload.get("page")
-                    if page == 1:
+                    offset = payload["offset"]
+                    if offset == 0:
                         rows = [
                             {"shipment_sn": f"SP{i:03d}", "pick_time": "2026-06-09", "status": 1, "wname": WAREHOUSE}
                             for i in range(20)
                         ]
-                    elif page == 2:
+                    elif offset == 20:
                         rows = [{"shipment_sn": "SP020", "pick_time": "2026-06-09", "status": 1, "wname": WAREHOUSE}]
                     else:
                         rows = []
@@ -196,29 +199,52 @@ class LingxingApiDataSourceTest(unittest.TestCase):
 
         list_payloads = [payload for endpoint, payload in client.post_payloads if endpoint.endswith("getInboundShipmentList")]
         self.assertEqual(len(rows), 21)
-        self.assertEqual([payload["page"] for payload in list_payloads], [1, 2, 3])
+        self.assertEqual([payload["offset"] for payload in list_payloads], [0, 20, 21])
 
-    def test_shipment_list_falls_back_to_offset_when_page_repeats(self) -> None:
+    def test_shipment_list_repeated_page_fails_instead_of_syncing_partial_data(self) -> None:
         class RepeatingPageClient(FakeClient):
             def post(self, endpoint, payload):
                 self.post_payloads.append((endpoint, payload))
                 if endpoint.endswith("getInboundShipmentList"):
-                    if "offset" in payload:
-                        rows = (
-                            [{"shipment_sn": "SP-OFFSET", "pick_time": "2026-06-09", "status": 1, "wname": WAREHOUSE}]
-                            if payload["offset"] == 0
-                            else []
-                        )
-                    else:
-                        rows = [{"shipment_sn": "SP-REPEAT", "pick_time": "2026-06-09", "status": 1, "wname": WAREHOUSE}]
+                    rows = [{"shipment_sn": "SP-REPEAT", "pick_time": "2026-06-09", "status": 1, "wname": WAREHOUSE}]
                     return {"code": 0, "data": {"list": rows}}
                 return super().post(endpoint, payload)
 
         client = RepeatingPageClient()
-        rows = LingxingApiDataSource(client=client)._fetch_shipment_headers("2026-06-09")
+        with self.assertRaisesRegex(LingxingClientError, "repeated a page"):
+            LingxingApiDataSource(client=client)._fetch_shipment_headers("2026-06-09")
 
-        self.assertEqual([row["shipment_sn"] for row in rows], ["SP-REPEAT"])
-        self.assertTrue(any("offset" in payload for endpoint, payload in client.post_payloads if endpoint.endswith("getInboundShipmentList")))
+    def test_legacy_chinese_status_config_is_sent_as_integer(self) -> None:
+        client = FakeClient()
+        with patch.dict(os.environ, {"LINGXING_SHIPMENT_STATUS": "已发货"}):
+            LingxingApiDataSource(client=client)._fetch_shipment_headers("2026-06-09")
+        self.assertIs(type(client.post_payloads[0][1]["status"]), int)
+        self.assertEqual(client.post_payloads[0][1]["status"], 1)
+
+    def test_pending_and_missing_dates_are_rejected_even_if_api_returns_them(self) -> None:
+        class MixedStatusClient(FakeClient):
+            def post(self, endpoint, payload):
+                self.post_payloads.append((endpoint, payload))
+                rows = [
+                    {"shipment_sn": "PENDING", "status": 0, "status_name": "待发货", "wname": WAREHOUSE},
+                    {"shipment_sn": "PENDING-DATED", "status": "0", "pick_time": "2026-06-09", "wname": WAREHOUSE},
+                    {"shipment_sn": "UNDATED", "status": 1, "wname": WAREHOUSE},
+                    {"shipment_sn": "UNKNOWN", "pick_time": "2026-06-09", "wname": WAREHOUSE},
+                    {"shipment_sn": "SHIPPED", "status": "1", "pick_time": "2026-06-09", "wname": WAREHOUSE},
+                ] if payload["offset"] == 0 else []
+                return {"code": 0, "data": {"list": rows}}
+        rows = LingxingApiDataSource(client=MixedStatusClient())._fetch_shipment_headers("2026-06-09")
+        self.assertEqual([r["shipment_sn"] for r in rows], ["SHIPPED"])
+
+    def test_old_pick_date_does_not_stop_pagination_for_current_shipments(self) -> None:
+        class OldPickDateClient(FakeClient):
+            def post(self, endpoint, payload):
+                offset = payload["offset"]
+                rows = [{"shipment_sn": f"SP{offset}", "status": 1, "wname": WAREHOUSE,
+                         "pick_time": "2026-06-01", "shipment_time": "2026-06-09"}] if offset < 2 else []
+                return {"code": 0, "data": {"list": rows}}
+        rows = LingxingApiDataSource(client=OldPickDateClient())._fetch_shipment_headers("2026-06-09")
+        self.assertEqual([r["shipment_sn"] for r in rows], ["SP0", "SP1"])
 
     def test_detail_uses_shipment_sn_first(self) -> None:
         client = FakeClient()
@@ -228,14 +254,27 @@ class LingxingApiDataSourceTest(unittest.TestCase):
 
         self.assertEqual(client.post_payloads[0][1], {"shipment_sn": "SP260610003"})
 
-    def test_detail_failure_falls_back_to_header(self) -> None:
+    def test_detail_failure_aborts_instead_of_returning_incomplete_header(self) -> None:
         client = FailingDetailClient()
         source = LingxingApiDataSource(client=client)
         header = {"shipment_sn": "SP260610003", "shipment_time": "2026-06-09"}
 
-        rows = source._fetch_shipment_detail(header)
+        with self.assertRaisesRegex(LingxingClientError, "not allowed"):
+            source._fetch_shipment_detail(header)
 
-        self.assertEqual(rows, [header])
+    def test_empty_detail_aborts_instead_of_returning_incomplete_header(self) -> None:
+        class EmptyDetailClient(FakeClient):
+            def post(self, endpoint, payload):
+                return {"code": 0, "data": {"items": []}}
+
+        source = LingxingApiDataSource(client=EmptyDetailClient())
+        with self.assertRaisesRegex(LingxingClientError, "no items for SP1"):
+            source._fetch_shipment_detail({"shipment_sn": "SP1"})
+
+    def test_detail_without_shipment_identifier_aborts(self) -> None:
+        source = LingxingApiDataSource(client=FakeClient())
+        with self.assertRaisesRegex(LingxingClientError, "no identifier"):
+            source._fetch_shipment_detail({"status": 1})
 
     def test_sku_failure_returns_blank_sku_info(self) -> None:
         client = FailingDetailClient()
@@ -405,7 +444,7 @@ class LingxingApiDataSourceTest(unittest.TestCase):
             def post(self, endpoint, payload):
                 self.post_payloads.append((endpoint, payload))
                 if endpoint.endswith("getInboundShipmentList"):
-                    rows = [{"shipment_sn": "SP260623003", "pick_time": "2026-06-23", "status": 1, "wname": WAREHOUSE}] if payload.get("page", 1) == 1 else []
+                    rows = [{"shipment_sn": "SP260623003", "pick_time": "2026-06-23", "status": 1, "wname": WAREHOUSE}] if payload.get("offset", 0) == 0 else []
                     return {"code": 0, "data": {"list": rows}}
                 if endpoint.endswith("purchaseOrderList"):
                     return {"code": 0, "data": {"list": [{"order_sn": "PO260525005", "purchaser_id": 7, "supplier_name": "SU00004-YZ"}]}}
@@ -680,7 +719,7 @@ class LingxingApiDataSourceTest(unittest.TestCase):
                             "status": 1,
                             "wname": WAREHOUSE,
                         }
-                    ] if payload.get("page", 1) == 1 else []
+                    ] if payload.get("offset", 0) == 0 else []
                     return {"code": 0, "data": {"list": rows}}
                 if endpoint.endswith("getInboundShipmentListMwsDetail"):
                     return {

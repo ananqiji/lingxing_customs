@@ -41,9 +41,11 @@ class LingxingApiDataSource(CustomsDataSource):
         )
         self.purchaser_list_endpoint = os.getenv("LINGXING_PURCHASER_LIST_ENDPOINT", "/erp/sc/routing/data/purchaser/lists")
         self.supplier_list_endpoint = os.getenv("LINGXING_SUPPLIER_LIST_ENDPOINT", "/erp/sc/data/local_inventory/supplier")
-        self.shipment_status = os.getenv("LINGXING_SHIPMENT_STATUS", "已发货")
+        configured_status = os.getenv("LINGXING_SHIPMENT_STATUS", "1").strip()
+        if configured_status not in ("", "1", "已发货", "shipped"):
+            raise ValueError("LINGXING_SHIPMENT_STATUS must be 1 (已发货)")
+        self.shipment_status = 1
         self.shipment_status_field = os.getenv("LINGXING_SHIPMENT_STATUS_FIELD", "status")
-        self.shipment_time_field = os.getenv("LINGXING_SHIPMENT_TIME_FIELD", "shipment_time")
         self.shipment_time_type_field = os.getenv("LINGXING_SHIPMENT_TIME_TYPE_FIELD", "time_type")
         self.shipment_time_type = os.getenv("LINGXING_SHIPMENT_TIME_TYPE", "0")
         self.shipment_warehouse_field = os.getenv("LINGXING_SHIPMENT_WAREHOUSE_FIELD", "wname")
@@ -74,16 +76,14 @@ class LingxingApiDataSource(CustomsDataSource):
     def _fetch_shipment_headers(self, shipment_time: str | None) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {}
         if shipment_time:
-            payload[self.shipment_time_field] = shipment_time
+            payload["start_date"] = shipment_time
+            payload["end_date"] = shipment_time
         if self.shipment_time_type != "":
             payload[self.shipment_time_type_field] = _coerce_int_string(self.shipment_time_type)
         if self.shipment_status:
             payload[self.shipment_status_field] = self.shipment_status
 
         rows, page_summaries = self._fetch_shipment_list_rows(payload, shipment_time)
-        if not rows and self.shipment_status:
-            fallback_payload = {k: v for k, v in payload.items() if k != self.shipment_status_field}
-            rows, page_summaries = self._fetch_shipment_list_rows(fallback_payload, shipment_time)
 
         filtered_rows = [
             row
@@ -96,53 +96,7 @@ class LingxingApiDataSource(CustomsDataSource):
         return filtered_rows
 
     def _fetch_shipment_list_rows(self, payload: dict[str, Any], shipment_time: str | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        rows, summaries, page_mode_effective = self._fetch_page_rows(payload, shipment_time)
-        if page_mode_effective:
-            return rows, summaries
-
-        offset_rows, offset_summaries = self._fetch_offset_page_rows(payload, shipment_time)
-        if len(offset_rows) > len(rows):
-            return offset_rows, offset_summaries
-        return rows, summaries
-
-    def _fetch_page_rows(self, payload: dict[str, Any], shipment_time: str | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
-        rows: list[dict[str, Any]] = []
-        summaries: list[dict[str, Any]] = []
-        seen_page_signatures: set[tuple[str, ...]] = set()
-        seen_shipment_sns: set[str] = set()
-        page_size = _client_page_size(self.client)
-        page = 1
-        while True:
-            page_payload = dict(payload)
-            page_payload["page"] = page
-            page_payload["page_size"] = page_size
-            data = self.client.post(self.fba_shipment_list_endpoint, page_payload)
-            items = _extract_rows(data)
-            summary = _page_summary("page", page_payload, items)
-            summaries.append(summary)
-            if not items:
-                return rows, summaries, True
-
-            signature = tuple(_shipment_identity(item) for item in items)
-            if signature in seen_page_signatures:
-                summaries[-1]["stop_reason"] = "duplicate_page"
-                return rows, summaries, False
-            seen_page_signatures.add(signature)
-
-            new_items = [item for item in items if _shipment_identity(item) not in seen_shipment_sns]
-            if not new_items:
-                summaries[-1]["stop_reason"] = "duplicate_shipments"
-                return rows, summaries, False
-            rows.extend(new_items)
-            seen_shipment_sns.update(_shipment_identity(item) for item in new_items)
-
-            if _is_before_target_date(items, shipment_time):
-                summaries[-1]["stop_reason"] = "before_target_date"
-                return rows, summaries, True
-            page += 1
-            if page > 500:
-                summaries[-1]["stop_reason"] = "max_pages"
-                return rows, summaries, True
+        return self._fetch_offset_page_rows(payload, shipment_time)
 
     def _fetch_offset_page_rows(self, payload: dict[str, Any], shipment_time: str | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         rows: list[dict[str, Any]] = []
@@ -164,29 +118,25 @@ class LingxingApiDataSource(CustomsDataSource):
 
             signature = tuple(_shipment_identity(item) for item in items)
             if signature in seen_signatures:
-                summaries[-1]["stop_reason"] = "duplicate_page"
-                return rows, summaries
+                raise LingxingClientError("Shipment list repeated a page; refusing to sync an incomplete batch")
             seen_signatures.add(signature)
 
             new_items = [item for item in items if _shipment_identity(item) not in seen_shipment_sns]
             if not new_items:
-                summaries[-1]["stop_reason"] = "duplicate_shipments"
-                return rows, summaries
+                raise LingxingClientError("Shipment list returned no new shipments; refusing to sync an incomplete batch")
             rows.extend(new_items)
             seen_shipment_sns.update(_shipment_identity(item) for item in new_items)
 
-            if _is_before_target_date(items, shipment_time):
-                summaries[-1]["stop_reason"] = "before_target_date"
-                return rows, summaries
-            offset += length
+            # The service may cap page length. Advance by rows actually consumed.
+            # Do not stop on pick_time: it can precede the actual shipping date.
+            offset += len(items)
             if offset > 10000:
-                summaries[-1]["stop_reason"] = "max_offset"
-                return rows, summaries
+                raise LingxingClientError("Shipment list exceeded 10000 rows; narrow the date range before syncing")
 
     def _fetch_shipment_detail(self, header: dict[str, Any]) -> list[dict[str, Any]]:
         candidate_values = _detail_candidate_values(header)
         if not candidate_values:
-            return [header]
+            raise LingxingClientError("Shipment header has no identifier; refusing to sync an incomplete batch")
 
         last_error: Exception | None = None
         for request_body in _detail_request_bodies(candidate_values):
@@ -196,7 +146,7 @@ class LingxingApiDataSource(CustomsDataSource):
                 last_error = exc
                 if _is_parameter_error(exc):
                     continue
-                return [header]
+                raise
 
             detail_data = data.get("data", data)
             items = _find_item_rows(detail_data)
@@ -205,11 +155,13 @@ class LingxingApiDataSource(CustomsDataSource):
                 for item in items:
                     expanded_items.extend(_expand_item_by_boxes(item))
                 return [dict(header, **item) for item in expanded_items]
-            return [header]
+            raise LingxingClientError(
+                f"Shipment detail returned no items for {candidate_values[0]}; refusing to sync an incomplete batch"
+            )
 
         if last_error is not None:
             raise LingxingClientError(f"Shipment detail parameter error after trying common parameter names. Last error: {last_error}") from last_error
-        return [header]
+        raise LingxingClientError("Shipment detail could not be loaded; refusing to sync an incomplete batch")
 
     def _fetch_sku_infos(self, sku_codes: set[str]) -> dict[str, SkuInfo]:
         sku_infos: dict[str, SkuInfo] = {}
@@ -1212,7 +1164,7 @@ def _count_by_field(rows: list[dict[str, Any]], field: str) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def _is_shipped(row: dict[str, Any], shipped_status: str) -> bool:
+def _is_shipped(row: dict[str, Any], shipped_status: int | str) -> bool:
     status_value = _first(row, {}, "status", "status_name", "shipment_status", "state", "state_name")
     status_text_values = [
         str(value)
@@ -1228,11 +1180,11 @@ def _is_shipped(row: dict[str, Any], shipped_status: str) -> bool:
     if any(_is_voided_status_text(value) for value in status_text_values):
         return False
     if status_value in (None, ""):
-        return True
-    status_text = str(status_value)
-    if status_text.isdigit():
-        return True
-    return shipped_status in status_text
+        return False
+    status_text = str(status_value).strip()
+    if status_text.lstrip("-").isdigit():
+        return int(status_text) == 1
+    return status_text in {"已发货", "shipped", "SHIPPED"}
 
 
 def _is_voided_status_text(value: str) -> bool:
@@ -1244,8 +1196,8 @@ def _matches_shipment_time(row: dict[str, Any], shipment_time: str | None) -> bo
         return True
     row_times = _shipment_time_values(row)
     if not row_times:
-        return True
-    return any(str(row_time).startswith(shipment_time) for row_time in row_times)
+        return False
+    return any(_date_text(row_time) == shipment_time for row_time in row_times)
 
 
 def _shipment_time_values(row: dict[str, Any]) -> list[Any]:

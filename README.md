@@ -34,6 +34,10 @@ scripts/       # Linux 部署、检查、手动运行、安装定时任务脚本
 
 发货计划写库，默认跑昨天和今天：
 
+发货单列表按领星官方协议传整数 `status=1`，使用 `start_date/end_date` 和
+`offset/length` 查询。旧配置 `LINGXING_SHIPMENT_STATUS=已发货` 会兼容转换为 `1`。
+待发货、作废及缺少日期的单据不会进入按日同步；列表重复分页、详情请求失败或详情为空时中止任务，避免用不完整结果写入或清理数据库。
+
 ```powershell
 .\.venv\Scripts\python.exe main.py --job shipment --write-db --debug-api
 ```
