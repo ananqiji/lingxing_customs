@@ -230,18 +230,24 @@ def export_customs_rows_to_mysql(
     config: MySQLConfig | None = None,
     *,
     delete_retention: bool = False,
+    excluded_shipments: set[tuple[str, str]] | None = None,
+    cleanup_shipments: dict[tuple[str, str], set[str]] | None = None,
 ) -> MySQLExportResult:
     config = config or MySQLConfig.from_env()
     protected_ids = _protected_customs_row_ids()
     protected_keys = _protected_customs_row_keys()
     protected_box_keys = _protected_customs_shipment_box_keys()
+    excluded_shipments = excluded_shipments or set()
+    eligible_rows = [row for row in data.customs_rows
+                     if (_cleanup_source(row), row.shipment_no) not in excluded_shipments]
     writable_rows = [
         row
-        for row in data.customs_rows
+        for row in eligible_rows
         if not _is_protected_customs_row(row, protected_ids, protected_keys, protected_box_keys)
     ]
     rows = [mysql_row_values(row) for row in writable_rows]
-    protected_skipped_rows = len(data.customs_rows) - len(writable_rows)
+    protected_skipped_rows = len(eligible_rows) - len(writable_rows)
+    eligible_data = CustomsWorkbookData(eligible_rows, data.issue_rows, data.purchase_split_rows)
     stale_deleted_by_source: dict[str, int] = {}
     retention_deleted_rows = 0
 
@@ -250,8 +256,11 @@ def export_customs_rows_to_mysql(
     try:
         connection, tunnel = _open_mysql_connection(config)
         with connection.cursor() as cursor:
-            _validate_mysql_target(cursor, config.table, data)
-            stale_deleted_by_source = _delete_stale_rows_for_current_batch(cursor, config.table, data)
+            _validate_mysql_target(cursor, config.table, eligible_data)
+            stale_deleted_by_source = _delete_stale_rows_for_current_batch(
+                cursor, config.table, eligible_data,
+                excluded_shipments=excluded_shipments, cleanup_shipments=cleanup_shipments,
+            )
             if rows:
                 cursor.executemany(build_upsert_sql(config.table), rows)
             if delete_retention:
@@ -466,7 +475,11 @@ def build_delete_retention_sql(table: str) -> str:
     return f"DELETE FROM {_quote_identifier(table)} WHERE `confirm_shipment` < %s"
 
 
-def _delete_stale_rows_for_current_batch(cursor: Any, table: str, data: CustomsWorkbookData) -> dict[str, int]:
+def _delete_stale_rows_for_current_batch(
+    cursor: Any, table: str, data: CustomsWorkbookData, *,
+    excluded_shipments: set[tuple[str, str]] | None = None,
+    cleanup_shipments: dict[tuple[str, str], set[str]] | None = None,
+) -> dict[str, int]:
     grouped_ids: dict[tuple[str, str], set[str]] = {}
     for row in data.customs_rows:
         source = _cleanup_source(row)
@@ -483,7 +496,19 @@ def _delete_stale_rows_for_current_batch(cursor: Any, table: str, data: CustomsW
         if not prefix:
             continue
         sorted_ids = sorted(ids)
-        cursor.execute(build_delete_stale_sql(table, len(sorted_ids)), [shipment_day, prefix, *sorted_ids])
+        sql = build_delete_stale_sql(table, len(sorted_ids))
+        params = [shipment_day, prefix, *sorted_ids]
+        excluded = sorted(number for item_source, number in (excluded_shipments or set()) if item_source == source)
+        if excluded:
+            sql += " AND `tran_id` NOT IN (" + ", ".join(["%s"] * len(excluded)) + ")"
+            params.extend(excluded)
+        scope = (cleanup_shipments or {}).get((source, shipment_day))
+        if scope is not None:
+            if not scope:
+                continue
+            sql += " AND `tran_id` IN (" + ", ".join(["%s"] * len(scope)) + ")"
+            params.extend(sorted(scope))
+        cursor.execute(sql, params)
         deleted_by_source[source] = deleted_by_source.get(source, 0) + int(getattr(cursor, "rowcount", 0) or 0)
     return deleted_by_source
 

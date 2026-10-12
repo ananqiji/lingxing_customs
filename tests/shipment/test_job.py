@@ -12,6 +12,18 @@ from src.shipment.models import RawCustomsData
 
 
 class ShipmentJobTest(unittest.TestCase):
+    def setUp(self):
+        self.mapping_patch = patch("src.shipment.job.load_shop_mapping_for_current_slot", return_value=SimpleNamespace(
+            mapping={}, warning=None, slot_key="test", source="test", loaded_rows=0))
+        self.mapping_patch.start()
+        self.addCleanup(self.mapping_patch.stop)
+        self.state_dir = TemporaryDirectory()
+        self.addCleanup(self.state_dir.cleanup)
+        from src.shipment.mapping_recovery import MappingRecoveryStore
+        store_patch = patch("src.shipment.job.MappingRecoveryStore", return_value=MappingRecoveryStore(self.state_dir.name + "/pending.sqlite3"))
+        store_patch.start()
+        self.addCleanup(store_patch.stop)
+
     def test_omitted_shipment_time_runs_yesterday_and_today(self) -> None:
         args = SimpleNamespace(shipment_time=None, shipment_time_provided=False)
 

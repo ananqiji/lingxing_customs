@@ -14,11 +14,15 @@ from src.shipment.export_excel import export_customs_workbook
 from src.shipment.export_mysql import export_customs_rows_to_mysql, preflight_customs_rows_mysql
 from src.shipment.fetcher import LingxingApiDataSource
 from src.shipment.issue_report import report_shipment_customs_data_issues
-from src.shipment.models import RawCustomsData
+from src.shipment.models import CustomsWorkbookData, RawCustomsData
+from src.shipment.mapping_recovery import MappingRecoveryStore
 from src.shipment.overseas_fetcher import OverseasWarehouseApiDataSource, write_overseas_field_debug
 from src.shipment.product_master import apply_product_master_data
 from src.shipment.sample_data import SampleDataSource
-from src.shipment.shop_mapping import apply_shop_mapping, load_shop_mapping_for_current_slot
+from src.shipment.shop_mapping import (
+    apply_shop_mapping, invalid_mapping_shipments,
+    load_shop_mapping_for_current_slot, missing_mapping_value,
+)
 from src.shipment.warehouse_region import apply_warehouse_region_mapping
 
 
@@ -26,35 +30,74 @@ def run_shipment_job(args: Any) -> None:
     if args.clear_cache:
         JsonCache().clear()
         print("Lingxing master-data cache cleared.")
-    shop_mapping = _load_shop_mapping()
+    recovery = MappingRecoveryStore() if args.write_db and not args.use_sample_data else None
+    source_names = _shipment_source_names(args)
+    pending = recovery.pending(_today(), source_names) if recovery else []
+    pending_keys = {(entry["source"], entry["shipment_no"]) for entry in pending}
+    shop_mapping = _load_shop_mapping(force_refresh=bool(pending))
     data_sources = _shipment_data_sources(args)
     shipment_times = _shipment_times(args)
     raw_data = _load_raw_data_for_dates(data_sources, shipment_times)
+    normal_keys = {(item.source, item.shipment_no) for item in raw_data.shipment_items}
+    cleanup_shipments = _load_pending_shipments(raw_data, pending, data_sources, source_names, shipment_times)
     _apply_product_master_data(raw_data)
     _apply_shop_mapping(raw_data, shop_mapping.mapping)
+    if invalid_mapping_shipments(raw_data):
+        shop_mapping = _load_shop_mapping(force_refresh=True)
+        _apply_shop_mapping(raw_data, shop_mapping.mapping)
+    skipped = invalid_mapping_shipments(raw_data)
+    if recovery:
+        recovery.record(raw_data, skipped)
+    present = {(item.source, item.shipment_no) for item in raw_data.shipment_items}
+    # Pending shipments absent from the API response must also survive same-day cleanup.
+    excluded = skipped | (pending_keys - present)
     _apply_warehouse_region_mapping(raw_data)
     write_overseas_field_debug(raw_data)
     workbook_data = build_customs_workbook_data(raw_data)
+    # The issue API replaces whole source/day snapshots. A partial historical
+    # recovery must not mark unrelated issues on that day as resolved.
+    normal_numbers = {number for _, number in normal_keys}
     report_shipment_customs_data_issues(
-        raw_data,
-        workbook_data,
+        RawCustomsData(
+            shipment_items=[item for item in raw_data.shipment_items if (item.source, item.shipment_no) in normal_keys],
+            sku_infos=raw_data.sku_infos,
+            purchase_batches=[batch for batch in raw_data.purchase_batches if batch.shipment_no in normal_numbers],
+            metadata=raw_data.metadata,
+        ),
+        CustomsWorkbookData(
+            [row for row in workbook_data.customs_rows if (row.source, row.shipment_no) in normal_keys],
+            [issue for issue in workbook_data.issue_rows if issue.shipment_no in normal_numbers],
+            [row for row in workbook_data.purchase_split_rows if row.shipment_no in normal_numbers],
+        ),
         shipment_times=shipment_times,
         source_names=_shipment_source_names(args),
     )
     output_path = _export_with_available_path(workbook_data, Path(args.output)) if args.output else None
+    writable_data = CustomsWorkbookData(
+        [row for row in workbook_data.customs_rows if (row.source, row.shipment_no) not in excluded],
+        workbook_data.issue_rows, workbook_data.purchase_split_rows,
+    )
+    recovered = 0
     if args.db_preflight:
-        result = preflight_customs_rows_mysql(workbook_data)
+        result = preflight_customs_rows_mysql(writable_data)
         print("MySQL preflight: OK")
         print(f"MySQL target table: {result.table}")
         print(f"MySQL rows ready: {result.row_count}")
         print(f"MySQL duplicate ids in current batch: {result.duplicate_id_count}")
     if args.write_db:
-        result = preflight_customs_rows_mysql(workbook_data)
+        result = preflight_customs_rows_mysql(writable_data)
         print("MySQL preflight: OK")
         print(f"MySQL target table: {result.table}")
         print(f"MySQL rows ready: {result.row_count}")
         retention_cleanup = _retention_cleanup_for_this_run(args)
-        db_result = export_customs_rows_to_mysql(workbook_data, delete_retention=retention_cleanup)
+        db_result = export_customs_rows_to_mysql(
+            writable_data, delete_retention=retention_cleanup,
+            excluded_shipments=excluded, cleanup_shipments=cleanup_shipments,
+        )
+        if recovery:
+            completed = {(row.source, row.shipment_no) for row in writable_data.customs_rows}
+            recovery.complete(completed)
+            recovered = len(completed & pending_keys)
         if retention_cleanup:
             _mark_retention_cleanup_done()
         for source, deleted_rows in sorted(db_result.stale_deleted_by_source.items()):
@@ -74,9 +117,12 @@ def run_shipment_job(args: Any) -> None:
     print(f"Customs rows: {len(workbook_data.customs_rows)}")
     print(f"Issue rows: {len(workbook_data.issue_rows)}")
     print(f"Purchase split rows: {len(workbook_data.purchase_split_rows)}")
-    pending_purchase_entities = sum(1 for row in workbook_data.customs_rows if row.purchase_entity == "待确认")
-    purchase_entities = sorted({row.purchase_entity for row in workbook_data.customs_rows if row.purchase_entity != "待确认"})
+    pending_purchase_entities = sum(missing_mapping_value(row.purchase_entity) for row in workbook_data.customs_rows)
+    pending_customers = sum(missing_mapping_value(row.final_customer) for row in workbook_data.customs_rows)
+    purchase_entities = sorted({row.purchase_entity for row in workbook_data.customs_rows if not missing_mapping_value(row.purchase_entity)})
     print(f"Pending purchase entity rows: {pending_purchase_entities}")
+    print(f"Pending final customer rows: {pending_customers}")
+    print(f"Mapping shipments skipped: {len(excluded)}; recovered: {recovered}")
     if purchase_entities:
         print("Purchase entities: " + ", ".join(purchase_entities[:10]))
     if not workbook_data.purchase_split_rows:
@@ -154,6 +200,32 @@ def _load_raw_data_for_dates(data_sources: list[Any], shipment_times: list[str])
     return combined
 
 
+def _load_pending_shipments(
+    raw_data: RawCustomsData, pending: list[dict], data_sources: list[Any],
+    source_names: list[str], shipment_times: list[str],
+) -> dict[tuple[str, str], set[str]]:
+    scopes: dict[tuple[str, str], set[str]] = {}
+    for entry in pending:
+        if entry["shipment_day"] not in shipment_times:
+            scopes.setdefault((entry["source"], entry["shipment_day"]), set()).add(entry["shipment_no"])
+    sources = dict(zip(source_names, data_sources))
+    for (source, day), numbers in sorted(scopes.items()):
+        try:
+            recovered = sources[source].load(shipment_time=day)
+        except Exception as exc:
+            print(f"Warning: pending mapping recovery failed for {source} {day}: {exc}")
+            continue
+        selected = [item for item in recovered.shipment_items if item.source == source and item.shipment_no in numbers]
+        if any(item.shipment_date[:10] != day for item in selected):
+            print(f"Warning: pending mapping recovery returned a different shipment day for {source} {day}; preserving pending entries")
+            continue
+        raw_data.shipment_items.extend(selected)
+        raw_data.purchase_batches.extend(batch for batch in recovered.purchase_batches if batch.shipment_no in numbers)
+        raw_data.sku_infos.update(recovered.sku_infos)
+        raw_data.metadata.update(recovered.metadata)
+    return scopes
+
+
 def _load_raw_data_for_date_parallel(data_sources: list[Any], shipment_time: str) -> list[RawCustomsData]:
     results: list[RawCustomsData | None] = [None] * len(data_sources)
     with ThreadPoolExecutor(max_workers=len(data_sources)) as executor:
@@ -192,9 +264,9 @@ def _apply_product_master_data(raw_data: RawCustomsData) -> None:
     print(f"Product master rows applied to shipment SKU info: {applied_rows}")
 
 
-def _load_shop_mapping():
+def _load_shop_mapping(*, force_refresh: bool = False):
     try:
-        result = load_shop_mapping_for_current_slot()
+        result = load_shop_mapping_for_current_slot(force_refresh=force_refresh)
     except Exception as exc:
         print(f"Warning: failed to load shop mapping: {exc}")
         from src.shipment.shop_mapping import ShopMappingLoadResult
@@ -209,11 +281,7 @@ def _load_shop_mapping():
 
 
 def _apply_shop_mapping(raw_data: RawCustomsData, mapping) -> None:
-    try:
-        loaded_rows, applied_rows = apply_shop_mapping(raw_data, mapping)
-    except Exception as exc:
-        print(f"Warning: failed to apply shop mapping: {exc}")
-        return
+    loaded_rows, applied_rows = apply_shop_mapping(raw_data, mapping)
     print(f"Shop mapping rows available: {loaded_rows}")
     print(f"Shop mapping rows applied to shipment items: {applied_rows}")
 

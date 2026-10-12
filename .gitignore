@@ -14,3 +14,4 @@ logs/
 data/
 deploy_package/
 .tmp_download/
+state/

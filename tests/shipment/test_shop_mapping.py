@@ -24,6 +24,11 @@ from src.shipment.shop_mapping import (
 
 
 class ShopMappingTest(unittest.TestCase):
+    def setUp(self):
+        sleep = patch("src.shipment.shop_mapping.time.sleep")
+        sleep.start()
+        self.addCleanup(sleep.stop)
+
     def test_generate_sign_matches_document_sample(self) -> None:
         self.assertEqual(
             generate_sign("abcdefgh", {"timestamp": "1619064310086"}),
@@ -75,7 +80,7 @@ class ShopMappingTest(unittest.TestCase):
 
         self.assertEqual(config.url, "https://www.foresight.radiancewave.cn/api/assetOpenApi/queryData")
 
-    def test_client_fetches_pages_and_last_duplicate_shop_wins(self) -> None:
+    def test_client_rejects_conflicting_shop_on_another_page(self) -> None:
         calls = []
 
         def fake_urlopen(request, timeout):
@@ -113,15 +118,12 @@ class ShopMappingTest(unittest.TestCase):
         )
 
         with patch("src.shipment.shop_mapping.urlopen", fake_urlopen):
-            mapping = ShopMappingClient(config).fetch_all()
+            with self.assertRaisesRegex(ShopMappingError, "conflicting"):
+                ShopMappingClient(config).fetch_all()
 
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 12)
         self.assertEqual(calls[0][0], {"apiId": "aOeOfPzADG", "pageIndex": 1, "pageSize": 2})
         self.assertEqual(calls[0][2], 5)
-        self.assertEqual(mapping["SHOP-A"].department, "业务三部")
-        self.assertEqual(mapping["SHOP-A"].purchase_entity, "采购主体A2")
-        self.assertEqual(mapping["SHOP-A"].final_customer, "客户A2")
-        self.assertEqual(mapping["SHOP-B"].purchase_entity, "采购主体B")
 
     def test_slot_key_uses_10_and_14_windows(self) -> None:
         self.assertEqual(shop_mapping_slot_key(datetime(2026, 7, 30, 9, 59)), "2026-07-29-1400")
@@ -188,7 +190,7 @@ class ShopMappingTest(unittest.TestCase):
         self.assertEqual(second.mapping["SHOP-B"].final_customer, "客户B")
         self.assertEqual(cache_files, ["latest.json"])
 
-    def test_refresh_failure_uses_latest_cache_and_does_not_retry_same_slot(self) -> None:
+    def test_refresh_failure_uses_latest_cache_and_retries_after_cooldown(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cache = JsonCache(cache_dir=Path(tmpdir))
             first_client = FakeShopMappingClient(
@@ -219,8 +221,75 @@ class ShopMappingTest(unittest.TestCase):
         self.assertIn("using latest cache", fallback.warning or "")
         self.assertEqual(fallback.mapping["SHOP-A"].purchase_entity, "采购主体A")
         self.assertEqual(failing_client.call_count, 1)
-        self.assertEqual(retry.source, "latest-cache")
-        self.assertEqual(retry_client.call_count, 0)
+        self.assertEqual(retry.source, "api")
+        self.assertEqual(retry_client.call_count, 1)
+
+    def test_200_plus_4_overlapping_rows_never_pass_validation(self):
+        client = ShopMappingClient(ShopMappingConfig("http://example", "key", "secret"))
+        rows = [{"shop_name": f"SHOP-{index}"} for index in range(200)]
+        with patch.object(client, "_fetch_page", side_effect=lambda page: rows if page == 1 else rows[:4]) as fetch:
+            with self.assertRaisesRegex(ShopMappingError, "duplicate"):
+                client.fetch_all()
+        self.assertEqual(fetch.call_count, 12)
+
+    def test_requires_two_consecutive_clean_equal_snapshots(self):
+        client = ShopMappingClient(ShopMappingConfig("http://example", "key", "secret", page_size=2))
+        a, b, c = [{"shop_name": name, "zzkh": "Customer"} for name in ("A", "B", "C")]
+        # A clean round, duplicate page, then two clean rounds (order may differ).
+        pages = [[a, b], [c], [a, b], [a], [a, b], [c], [c, a], [b]]
+        with patch.object(client, "_fetch_page", side_effect=pages) as fetch:
+            mapping = client.fetch_all()
+        self.assertEqual(set(mapping), {"A", "B", "C"})
+        self.assertEqual(fetch.call_count, 8)
+
+    def test_changed_field_requires_another_equal_snapshot(self):
+        client = ShopMappingClient(ShopMappingConfig("http://example", "key", "secret"))
+        pages = [[{"shop_name": "A", "zzkh": customer}] for customer in ("Old", "New", "New")]
+        with patch.object(client, "_fetch_page", side_effect=pages) as fetch:
+            self.assertEqual(client.fetch_all()["A"].final_customer, "New")
+        self.assertEqual(fetch.call_count, 3)
+
+    def test_rate_limit_does_not_multiply_page_and_snapshot_retries(self):
+        client = ShopMappingClient(ShopMappingConfig("http://example", "key", "secret"))
+        with patch.object(client, "_post_json", return_value={"code": "429", "msg": "超过接口最大调用次数!"}) as post:
+            with self.assertRaisesRegex(ShopMappingError, "超过接口最大调用次数"):
+                client.fetch_all()
+        self.assertEqual(post.call_count, 1)
+
+    def test_legacy_cache_is_not_a_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = JsonCache(tmpdir)
+            cache.set("shop_mapping", "latest", {
+                "slot_key": "2026-07-30-1000", "records": [{"shop_name": "A"}],
+            })
+            result = load_shop_mapping_for_current_slot(datetime(2026, 7, 30, 10),
+                client=FakeShopMappingClient({}, ShopMappingError("failed")), cache=cache)
+            self.assertEqual(result.mapping, {})
+            refreshed = load_shop_mapping_for_current_slot(datetime(2026, 7, 30, 10, 5),
+                client=FakeShopMappingClient({"A": ShopMappingRecord("A")}), cache=cache)
+            self.assertTrue(refreshed.refreshed)
+            self.assertEqual(cache.get("shop_mapping", "latest", 3650)["validation_version"], 1)
+
+    def test_forced_refresh_obeys_five_minute_cooldown(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = JsonCache(tmpdir)
+            client = FakeShopMappingClient({"A": ShopMappingRecord("A")})
+            load_shop_mapping_for_current_slot(datetime(2026, 7, 30, 10), client=client, cache=cache)
+            load_shop_mapping_for_current_slot(datetime(2026, 7, 30, 10, 4, 59), client=client, cache=cache, force_refresh=True)
+            self.assertEqual(client.call_count, 1)
+            load_shop_mapping_for_current_slot(datetime(2026, 7, 30, 10, 5), client=client, cache=cache, force_refresh=True)
+            self.assertEqual(client.call_count, 2)
+
+    def test_atomic_replace_failure_preserves_last_valid_cache(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = JsonCache(tmpdir)
+            client = FakeShopMappingClient({"A": ShopMappingRecord("A")})
+            load_shop_mapping_for_current_slot(datetime(2026, 7, 30, 10), client=client, cache=cache)
+            before = cache.get("shop_mapping", "latest", 3650)
+            with patch("src.shipment.shop_mapping.os.replace", side_effect=OSError("disk failure")):
+                with self.assertRaises(OSError):
+                    load_shop_mapping_for_current_slot(datetime(2026, 7, 30, 14), client=client, cache=cache)
+            self.assertEqual(cache.get("shop_mapping", "latest", 3650), before)
 
     def test_apply_mapping_sets_purchase_entity_and_final_customer_by_shop(self) -> None:
         raw = _raw_data()

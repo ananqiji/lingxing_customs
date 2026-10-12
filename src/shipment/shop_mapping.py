@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import time
+import tempfile
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
@@ -22,9 +23,16 @@ DEFAULT_API_ID = "aOeOfPzADG"
 DEFAULT_URL = "https://www.foresight.radiancewave.cn/api/assetOpenApi/queryData"
 LOCK_TIMEOUT_SECONDS = 600
 LOCK_STALE_SECONDS = 900
+VALIDATION_VERSION = 1
+SNAPSHOT_ATTEMPTS = 6
+REFRESH_COOLDOWN_SECONDS = 300
 
 
 class ShopMappingError(RuntimeError):
+    pass
+
+
+class ShopMappingRateLimitError(ShopMappingError):
     pass
 
 
@@ -87,19 +95,46 @@ class ShopMappingClient:
         self.config = config or ShopMappingConfig.from_env()
 
     def fetch_all(self) -> dict[str, ShopMappingRecord]:
+        previous = None
+        last_error = "snapshots did not agree"
+        for attempt in range(SNAPSHOT_ATTEMPTS):
+            if attempt:
+                time.sleep(1)
+            try:
+                current = self._fetch_snapshot()
+            except ShopMappingRateLimitError:
+                raise
+            except ShopMappingError as exc:
+                previous = None
+                last_error = str(exc)
+                continue
+            if current == previous:
+                return current
+            previous = current
+            last_error = "two consecutive clean snapshots did not agree"
+        raise ShopMappingError(f"Shop mapping snapshot validation failed: {last_error}")
+
+    def _fetch_snapshot(self) -> dict[str, ShopMappingRecord]:
         mapping: dict[str, ShopMappingRecord] = {}
         page_index = 1
         while True:
             rows = self._fetch_page(page_index)
             for row in rows:
                 record = _record_from_row(row)
-                if record is not None:
-                    mapping[record.shop_name] = record
+                if record is None:
+                    raise ShopMappingError("Shop mapping page contains a row without shop_name")
+                if record.shop_name in mapping:
+                    reason = "conflicting" if mapping[record.shop_name] != record else "duplicate"
+                    raise ShopMappingError(f"Shop mapping {reason} shop on page {page_index}: {record.shop_name}")
+                mapping[record.shop_name] = record
             if len(rows) < self.config.page_size:
+                if not mapping:
+                    raise ShopMappingError("Shop mapping snapshot is empty")
                 return mapping
             page_index += 1
             if page_index > 1000:
                 raise ShopMappingError("Shop mapping API pagination exceeded 1000 pages")
+            time.sleep(1)
 
     def _fetch_page(self, page_index: int) -> list[dict[str, Any]]:
         payload = {
@@ -114,6 +149,10 @@ class ShopMappingClient:
                 _raise_for_api_error(data)
                 return _extract_rows(data)
             except (HTTPError, URLError, TimeoutError, ValueError, ShopMappingError) as exc:
+                if isinstance(exc, ShopMappingRateLimitError):
+                    raise
+                if isinstance(exc, HTTPError) and exc.code == 429:
+                    raise ShopMappingRateLimitError("Shop mapping API rate limited (HTTP 429)") from exc
                 last_error = exc
                 if attempt >= self.config.max_retries:
                     break
@@ -147,13 +186,15 @@ def load_shop_mapping_for_current_slot(
     now: datetime | None = None,
     client: ShopMappingClient | None = None,
     cache: JsonCache | None = None,
+    *,
+    force_refresh: bool = False,
 ) -> ShopMappingLoadResult:
     now = now or datetime.now()
     cache = cache or JsonCache()
     slot_key = shop_mapping_slot_key(now)
     latest_payload = _cache_get_mapping_payload(cache, "latest")
     cached_mapping = _mapping_from_payload(latest_payload) if _payload_slot_key(latest_payload) == slot_key else None
-    if cached_mapping is not None:
+    if cached_mapping is not None and not force_refresh:
         _prune_shop_mapping_cache(cache)
         return ShopMappingLoadResult(
             mapping=cached_mapping,
@@ -165,7 +206,7 @@ def load_shop_mapping_for_current_slot(
     with _shop_mapping_lock(cache):
         latest_payload = _cache_get_mapping_payload(cache, "latest")
         cached_mapping = _mapping_from_payload(latest_payload) if _payload_slot_key(latest_payload) == slot_key else None
-        if cached_mapping is not None:
+        if cached_mapping is not None and not force_refresh:
             _prune_shop_mapping_cache(cache)
             return ShopMappingLoadResult(
                 mapping=cached_mapping,
@@ -176,7 +217,13 @@ def load_shop_mapping_for_current_slot(
 
         attempt = cache.get("shop_mapping_attempt", slot_key, ttl_days=3650)
         if isinstance(attempt, dict):
-            return _latest_or_empty(cache, slot_key, f"shop mapping API was already attempted for slot {slot_key}: {attempt.get('error', '')}")
+            try:
+                attempted_at = datetime.fromisoformat(attempt.get("attempted_at", ""))
+                cooling_down = (now - attempted_at).total_seconds() < REFRESH_COOLDOWN_SECONDS
+            except (ValueError, TypeError):
+                cooling_down = False
+            if cooling_down:
+                return _latest_or_empty(cache, slot_key, "shop mapping refresh is in its 5 minute cooldown")
 
         try:
             api_client = client or ShopMappingClient()
@@ -192,11 +239,12 @@ def load_shop_mapping_for_current_slot(
             return _latest_or_empty(cache, slot_key, str(exc))
 
         payload = {
+            "validation_version": VALIDATION_VERSION,
             "slot_key": slot_key,
             "refreshed_at": now.isoformat(timespec="seconds"),
             "records": [asdict(record) for record in mapping.values()],
         }
-        cache.set("shop_mapping", "latest", payload)
+        _save_validated_mapping(cache, payload)
         _prune_shop_mapping_cache(cache)
         cache.set(
             "shop_mapping_attempt",
@@ -247,9 +295,37 @@ def apply_shop_mapping(raw_data: RawCustomsData, mapping: dict[str, ShopMappingR
 
 
 def _purchase_entity_from_record(record: ShopMappingRecord) -> str:
-    if record.purchase_entity:
+    if not missing_mapping_value(record.purchase_entity):
         return record.purchase_entity
     return purchase_entity_for_seller(record.shop_name, {record.shop_name: record.department})
+
+
+def missing_mapping_value(value: Any) -> bool:
+    return str(value or "").strip() in {"", "待确认"}
+
+
+def invalid_mapping_shipments(raw_data: RawCustomsData) -> set[tuple[str, str]]:
+    return {
+        (item.source, item.shipment_no)
+        for item in raw_data.shipment_items
+        if missing_mapping_value(item.purchase_entity) or missing_mapping_value(item.final_customer)
+    }
+
+
+def _save_validated_mapping(cache: JsonCache, payload: dict[str, Any]) -> None:
+    path = Path(cache.cache_dir) / "shop_mapping" / "latest.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump({"saved_at": time.time(), "value": payload}, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def shop_mapping_slot_key(now: datetime) -> str:
@@ -301,7 +377,7 @@ def _cache_get_mapping_payload(cache: JsonCache, key: str) -> dict[str, Any] | N
 
 
 def _mapping_from_payload(payload: dict[str, Any] | None) -> dict[str, ShopMappingRecord] | None:
-    if payload is None:
+    if payload is None or payload.get("validation_version") != VALIDATION_VERSION:
         return None
     records = payload.get("records")
     if not isinstance(records, list):
@@ -309,7 +385,7 @@ def _mapping_from_payload(payload: dict[str, Any] | None) -> dict[str, ShopMappi
     mapping: dict[str, ShopMappingRecord] = {}
     for item in records:
         if not isinstance(item, dict):
-            continue
+            return None
         record = _record_from_row(
             {
                 "shop_name": item.get("shop_name"),
@@ -318,9 +394,10 @@ def _mapping_from_payload(payload: dict[str, Any] | None) -> dict[str, ShopMappi
                 "zzkh": item.get("final_customer"),
             }
         )
-        if record is not None:
-            mapping[record.shop_name] = record
-    return mapping
+        if record is None or record.shop_name in mapping:
+            return None
+        mapping[record.shop_name] = record
+    return mapping or None
 
 
 def _payload_slot_key(payload: dict[str, Any] | None) -> str:
@@ -394,14 +471,14 @@ def _record_from_row(row: dict[str, Any]) -> ShopMappingRecord | None:
 
 def _extract_rows(data: Any) -> list[dict[str, Any]]:
     if isinstance(data, list):
-        return [item for item in data if isinstance(item, dict)]
-    if not isinstance(data, dict):
-        return []
-    for key in ("data", "list", "items", "rows", "records"):
-        rows = _extract_rows(data.get(key))
-        if rows:
-            return rows
-    return []
+        if any(not isinstance(item, dict) for item in data):
+            raise ShopMappingError("Shop mapping page contains invalid rows")
+        return data
+    if isinstance(data, dict):
+        for key in ("data", "list", "items", "rows", "records"):
+            if key in data:
+                return _extract_rows(data[key])
+    raise ShopMappingError("Shop mapping response has no row list")
 
 
 def _raise_for_api_error(data: dict[str, Any]) -> None:
@@ -410,6 +487,8 @@ def _raise_for_api_error(data: dict[str, Any]) -> None:
     if success is True or code in (200, "200", 0, "0"):
         return
     message = data.get("msg") or data.get("message") or data
+    if code in (429, "429") or "超过接口最大调用次数" in str(message):
+        raise ShopMappingRateLimitError(str(message))
     raise ShopMappingError(str(message))
 
 
