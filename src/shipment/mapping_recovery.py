@@ -4,10 +4,11 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 
 from src.shipment.models import RawCustomsData
+from src.shipment.retention import shipment_retention_cutoff
 from src.shipment.shop_mapping import missing_mapping_value
 
 
@@ -35,7 +36,7 @@ class MappingRecoveryStore:
             db.close()
 
     def pending(self, today: date, sources: list[str]) -> list[dict]:
-        cutoff = (today - timedelta(days=6)).isoformat()
+        cutoff = shipment_retention_cutoff(today).isoformat()
         with self._connect() as db:
             db.execute("UPDATE pending SET status='expired' WHERE shipment_day < ?", (cutoff,))
             rows = db.execute(

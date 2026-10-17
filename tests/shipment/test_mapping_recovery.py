@@ -26,11 +26,11 @@ def item(number="SP1", shop="A", day="2026-10-09", sku="SKU1"):
 
 
 class RecoveryTest(unittest.TestCase):
-    def test_store_survives_restart_and_cache_clear_with_seven_day_boundary(self):
+    def test_store_survives_restart_and_cache_clear_with_ten_day_boundary(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "state" / "pending.sqlite3"
             store = MappingRecoveryStore(path)
-            raw = RawCustomsData(shipment_items=[item(day="2026-10-06"), item("SP2", day="2026-10-05")])
+            raw = RawCustomsData(shipment_items=[item(day="2026-10-03"), item("SP2", day="2026-10-02")])
             store.record(raw, {("amazon", "SP1"), ("amazon", "SP2")})
             JsonCache(Path(directory) / ".cache").clear()
             reopened = MappingRecoveryStore(path)

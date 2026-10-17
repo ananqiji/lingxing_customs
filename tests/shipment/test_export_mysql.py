@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
+import sqlite3
 import unittest
+from contextlib import closing
 from datetime import date
 from decimal import Decimal
 from unittest.mock import patch
@@ -158,6 +160,31 @@ class ExportMySQLTest(unittest.TestCase):
         sql = build_delete_retention_sql("customs_bill_parcels")
 
         self.assertEqual(sql, "DELETE FROM `customs_bill_parcels` WHERE `confirm_shipment` < %s")
+
+    def test_retention_keeps_tenth_day_and_deletes_only_older_rows(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as db:
+            db.execute("CREATE TABLE parcels (id TEXT PRIMARY KEY, confirm_shipment TEXT)")
+            db.executemany("INSERT INTO parcels VALUES (?, ?)", [
+                ("expired", "2026-10-07"), ("tenth_day", "2026-10-08"),
+                ("eighth_day", "2026-10-10"), ("today", "2026-10-17"),
+                ("future", "2026-10-18"), ("undated", None),
+            ])
+
+            class Cursor:
+                rowcount = 0
+
+                def execute(self, sql, params):
+                    self.rowcount = db.execute(sql.replace("%s", "?"), params).rowcount
+
+            deleted = export_mysql._delete_rows_before_retention_cutoff(
+                Cursor(), "parcels", export_mysql._retention_cutoff(date(2026, 10, 17)),
+            )
+            self.assertEqual(deleted, 1)
+            self.assertEqual({row[0] for row in db.execute("SELECT id FROM parcels")},
+                             {"tenth_day", "eighth_day", "today", "future", "undated"})
+
+    def test_ten_day_retention_crosses_year_boundary(self) -> None:
+        self.assertEqual(export_mysql._retention_cutoff(date(2027, 1, 5)), date(2026, 12, 27))
 
     def test_validate_table_columns_reports_missing_columns(self) -> None:
         columns = [column for _, column in MYSQL_COLUMNS if column not in {"tran_way", "update_time"}]
@@ -450,7 +477,7 @@ class ExportMySQLTest(unittest.TestCase):
         self.assertEqual(result.retention_deleted_rows, 4)
         delete_calls = [(sql, params) for sql, params in fake_pymysql.connection.cursor_obj.execute_calls if sql.startswith("DELETE FROM")]
         self.assertEqual(len(delete_calls), 1)
-        self.assertEqual(delete_calls[0][1], ["2026-06-11"])
+        self.assertEqual(delete_calls[0][1], ["2026-06-08"])
         self.assertEqual(fake_pymysql.connection.cursor_obj.executemany_calls, [])
 
     def test_export_rolls_back_only_when_connection_exists(self) -> None:

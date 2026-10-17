@@ -3,12 +3,13 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Iterable
 
 from src.common.lingxing_client import _load_dotenv
 from src.shipment.models import CustomsRow, CustomsWorkbookData
+from src.shipment.retention import shipment_retention_cutoff
 
 
 MYSQL_COLUMNS = [
@@ -519,7 +520,7 @@ def _delete_rows_before_retention_cutoff(cursor: Any, table: str, cutoff: date) 
 
 
 def _retention_cutoff(today: date | None = None) -> date:
-    return (today or _today()) - timedelta(days=6)
+    return shipment_retention_cutoff(today or _today())
 
 
 def _today() -> date:
